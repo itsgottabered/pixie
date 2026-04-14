@@ -1,0 +1,2 @@
+[console_scripts]
+pixie = pixie.cli:main
