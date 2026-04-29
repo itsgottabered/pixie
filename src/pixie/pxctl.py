@@ -25,6 +25,12 @@ PX_LABEL     = "name=portworx"
 # Portworx topology label prefix
 TOPO_PREFIX = "topology.portworx.io/"
 
+# Known Portworx CSI/in-tree provisioner names
+PX_PROVISIONERS = frozenset({
+    "pxd.portworx.com",
+    "kubernetes.io/portworx-volume",
+})
+
 
 class PxError(Exception):
     pass
@@ -210,13 +216,56 @@ class Pxctl:
         """Inspect a single volume by ID."""
         return self.run("volume", "inspect", volume_id)
 
-    def fetch_volumes(self, list_kwargs: dict) -> list[dict]:
-        """List volumes with given filters, then inspect each for full detail.
+    def _is_px_pvc(self, item: dict) -> bool:
+        """Return True if a PVC item is backed by Portworx.
 
-        list_kwargs are passed directly to volume_list().
-        Returns fully-inspected volume dicts.
+        Checks (in order):
+          1. volume.beta.kubernetes.io/storage-provisioner annotation
+          2. storageClassName starting with "px-" (fallback for older clusters)
         """
-        vols = self.volume_list(**list_kwargs)
+        annotations = (item.get("metadata") or {}).get("annotations") or {}
+        provisioner = annotations.get("volume.beta.kubernetes.io/storage-provisioner", "")
+        if provisioner in PX_PROVISIONERS:
+            return True
+        sc = (item.get("spec") or {}).get("storageClassName", "") or ""
+        return sc.startswith("px-")
+
+    def _kubectl_px_pvcs(self, namespace: str) -> list[tuple[str, str]]:
+        """Return (pvc_name, pv_name) tuples for Portworx PVCs in *namespace*.
+
+        pv_name (spec.volumeName, e.g. pvc-1c904458-...) is used directly
+        with `pxctl volume inspect` to avoid a redundant volume list lookup.
+        """
+        try:
+            result = subprocess.run(
+                ["kubectl", "get", "pvc", "-n", namespace, "-o", "json"],
+                capture_output=True, text=True, check=True,
+            )
+            data = json.loads(result.stdout)
+        except subprocess.CalledProcessError as e:
+            print(f"  [kubectl] warning: get pvc failed: {e.stderr.strip()}", file=sys.stderr)
+            return []
+        except (json.JSONDecodeError, FileNotFoundError) as e:
+            print(f"  [kubectl] warning: {e}", file=sys.stderr)
+            return []
+
+        items = data.get("items", [])
+        pvcs = [
+            (item["metadata"]["name"], (item.get("spec") or {}).get("volumeName", ""))
+            for item in items
+            if self._is_px_pvc(item)
+        ]
+
+        if self.verbose:
+            print(f"  [kubectl] {len(items)} PVC(s) in namespace, {len(pvcs)} Portworx", file=sys.stderr)
+            non_px = [i["metadata"]["name"] for i in items if not self._is_px_pvc(i)]
+            if non_px:
+                print(f"  [kubectl] skipped (non-Portworx): {non_px}", file=sys.stderr)
+
+        return pvcs
+
+    def _inspect_volume_list(self, vols: list[dict]) -> list[dict]:
+        """Inspect each volume in *vols*, returning fully-detailed dicts."""
         detailed = []
         for v in vols:
             vid = v.get("id") or v.get("Id")
@@ -231,6 +280,68 @@ class Pxctl:
                 if self.verbose:
                     print(f"  [pxctl] warning: inspect {vid} failed: {e}", file=sys.stderr)
                 detailed.append(v)
+        return detailed
+
+    def fetch_volumes(self, list_kwargs: dict) -> list[dict]:
+        """List volumes with given filters, then inspect each for full detail.
+
+        When fetching by namespace, also queries kubectl to find any Portworx PVCs
+        that pxctl missed due to missing namespace labels, and fetches those by name.
+
+        list_kwargs are passed directly to volume_list().
+        Returns fully-inspected volume dicts.
+        """
+        vols = self.volume_list(**list_kwargs)
+        detailed = self._inspect_volume_list(vols)
+
+        namespace = list_kwargs.get("namespace")
+        if not namespace:
+            return detailed
+
+        # Build the set of PVC names already retrieved
+        fetched_pvcs: set[str] = set()
+        for d in detailed:
+            locator = d.get("locator") or {}
+            labels = (locator.get("volume_labels") or
+                      (d.get("spec") or {}).get("volume_labels") or
+                      d.get("labels") or {})
+            pvc_name = labels.get("pvc", "") if isinstance(labels, dict) else ""
+            if pvc_name:
+                fetched_pvcs.add(pvc_name)
+
+        # Compare against what kubectl sees
+        kube_pvcs = self._kubectl_px_pvcs(namespace)
+        missing = [(pvc, pv) for pvc, pv in kube_pvcs if pvc not in fetched_pvcs]
+
+        if missing:
+            print(
+                f"  [{len(missing)} PVC(s) missing from pxctl label query; "
+                f"fetching by volume name]",
+                file=sys.stderr,
+            )
+            if self.verbose:
+                for pvc_name, pv_name in missing:
+                    print(f"    {pvc_name} ({pv_name})", file=sys.stderr)
+
+            for pvc_name, pv_name in missing:
+                if not pv_name:
+                    if self.verbose:
+                        print(f"  [pxctl] warning: no volumeName for PVC {pvc_name!r}, skipping", file=sys.stderr)
+                    continue
+                try:
+                    detail = self.volume_inspect(pv_name)
+                    if isinstance(detail, list):
+                        detail = detail[0]
+                    # Backfill namespace/pvc labels that pxctl omitted
+                    locator = detail.setdefault("locator", {})
+                    vol_labels = locator.setdefault("volume_labels", {})
+                    vol_labels.setdefault("namespace", namespace)
+                    vol_labels.setdefault("pvc", pvc_name)
+                    detailed.append(detail)
+                except PxError as e:
+                    if self.verbose:
+                        print(f"  [pxctl] warning: inspect {pv_name!r} failed: {e}", file=sys.stderr)
+
         return detailed
 
     # ── HA update commands ────────────────────────────────────────────────────
